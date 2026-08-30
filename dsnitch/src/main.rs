@@ -1,8 +1,9 @@
+mod dns;
 mod docker;
 
 use std::{
     fs::File,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     path::PathBuf,
     sync::Arc,
     time::Duration,
@@ -12,12 +13,13 @@ use anyhow::Context;
 use aya::{
     include_bytes_aligned,
     maps::RingBuf,
-    programs::{CgroupAttachMode, CgroupSockAddr},
+    programs::{CgroupAttachMode, CgroupSkb, CgroupSkbAttachType, CgroupSockAddr},
     Ebpf,
 };
 use clap::Parser;
+use dns::DnsCache;
 use docker::{ContainerInfo, DockerManager};
-use dsnitch_common::ConnectEvent;
+use dsnitch_common::{ConnectEvent, DnsPacketEvent};
 use tokio::signal;
 
 #[derive(Parser, Debug)]
@@ -44,34 +46,38 @@ async fn main() -> anyhow::Result<()> {
 
     bump_memlock_rlimit()?;
 
-    println!("\x1b[1;36m[dsnitch]\x1b[0m Initializing Docker Egress Inspector (Phase 2: Docker Integration)...");
-    println!("[INFO] Target cgroup path: {}", args.cgroup_path.display());
+    log::info!("Initializing Docker Egress & DNS Inspector (Phase 3: DNS Enrichment)...");
+    log::info!("Target cgroup path: {}", args.cgroup_path.display());
 
-    // 1. Initialize Docker Engine synchronizer
+    // 1. Initialize Per-Cgroup DNS Cache
+    let dns_cache = Arc::new(DnsCache::new(256));
+
+    // 2. Initialize Docker Engine synchronizer
     let docker_mgr = match DockerManager::new() {
         Ok(mgr) => {
             let mgr = Arc::new(mgr);
             match mgr.sync_running_containers().await {
                 Ok(count) => {
-                    println!("\x1b[1;32m[DOCKER]\x1b[0m Connected to Docker daemon (Active containers: {})", count);
+                    log::info!("Connected to Docker daemon (Active containers: {})", count);
                 }
                 Err(err) => {
-                    println!("\x1b[1;33m[WARN]\x1b[0m Could not list running containers: {:#}", err);
+                    log::warn!("Could not list running containers: {:#}", err);
                 }
             }
             let listener_mgr = Arc::clone(&mgr);
+            let listener_dns = Arc::clone(&dns_cache);
             tokio::spawn(async move {
-                listener_mgr.start_event_listener().await;
+                listener_mgr.start_event_listener(Some(listener_dns)).await;
             });
             Some(mgr)
         }
         Err(err) => {
-            println!("\x1b[1;33m[WARN]\x1b[0m Docker not available: {:#}. Running in host-only mode.", err);
+            log::warn!("Docker not available: {:#}. Running in host-only mode.", err);
             None
         }
     };
 
-    // 2. Load eBPF bytecode
+    // 3. Load eBPF bytecode
     #[cfg(debug_assertions)]
     let bpf_bytes = include_bytes_aligned!("../../dsnitch-ebpf/target/bpfel-unknown-none/debug/dsnitch");
     #[cfg(not(debug_assertions))]
@@ -87,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
         let prog4: &mut CgroupSockAddr = prog.try_into()?;
         prog4.load()?;
         prog4.attach(&cgroup_file, CgroupAttachMode::Single)?;
-        println!("\x1b[1;32m[SUCCESS]\x1b[0m Attached connect4 probe to cgroup v2");
+        log::info!("Attached connect4 probe to cgroup v2");
     }
 
     // Attach IPv6 connect hook
@@ -95,17 +101,36 @@ async fn main() -> anyhow::Result<()> {
         let prog6: &mut CgroupSockAddr = prog.try_into()?;
         prog6.load()?;
         prog6.attach(&cgroup_file, CgroupAttachMode::Single)?;
-        println!("\x1b[1;32m[SUCCESS]\x1b[0m Attached connect6 probe to cgroup v2");
+        log::info!("Attached connect6 probe to cgroup v2");
     }
 
-    // Open Ring Buffer map
+    // Attach DNS packet snooper (cgroup_skb ingress & egress)
+    if let Some(prog) = ebpf.program_mut("dsnitch_dns_ingress") {
+        let prog_dns: &mut CgroupSkb = prog.try_into()?;
+        prog_dns.load()?;
+        prog_dns.attach(&cgroup_file, CgroupSkbAttachType::Ingress, CgroupAttachMode::Single)?;
+        log::info!("Attached DNS ingress snooper to cgroup v2 (UDP/53)");
+    }
+    if let Some(prog) = ebpf.program_mut("dsnitch_dns_egress") {
+        let prog_dns: &mut CgroupSkb = prog.try_into()?;
+        prog_dns.load()?;
+        prog_dns.attach(&cgroup_file, CgroupSkbAttachType::Egress, CgroupAttachMode::Single)?;
+        log::info!("Attached DNS egress snooper to cgroup v2 (UDP/53)");
+    }
+
+    // Open Ring Buffer maps
     let ring_buf_map = ebpf.take_map("EVENTS").context("Map EVENTS not found in eBPF program")?;
     let mut ring_buf = RingBuf::try_from(ring_buf_map)?;
 
-    println!("\n{:<12} {:<24} {:<16} {:<20} {:<6} {:<30}", "TIME", "CONTAINER", "SERVICE", "IMAGE/PROCESS", "PROTO", "DESTINATION");
-    println!("{}", "─".repeat(115));
+    let dns_ring_buf_map = ebpf
+        .take_map("DNS_EVENTS")
+        .context("Map DNS_EVENTS not found in eBPF program")?;
+    let mut dns_ring_buf = RingBuf::try_from(dns_ring_buf_map)?;
 
-    let mut interval = tokio::time::interval(Duration::from_millis(50));
+    println!("\n{:<12} {:<24} {:<16} {:<20} {:<6} {:<36}", "TIME", "CONTAINER", "SERVICE", "IMAGE/PROCESS", "PROTO", "DESTINATION");
+    println!("{}", "─".repeat(120));
+
+    let mut interval = tokio::time::interval(Duration::from_millis(30));
     loop {
         tokio::select! {
             _ = signal::ctrl_c() => {
@@ -113,6 +138,16 @@ async fn main() -> anyhow::Result<()> {
                 break;
             }
             _ = interval.tick() => {
+                // 1. Drain incoming DNS response packets first
+                while let Some(item) = dns_ring_buf.next() {
+                    let data = item.as_ref();
+                    if data.len() >= std::mem::size_of::<DnsPacketEvent>() {
+                        let dns_event = unsafe { *(data.as_ptr() as *const DnsPacketEvent) };
+                        dns_cache.process_packet(&dns_event).await;
+                    }
+                }
+
+                // 2. Drain outbound socket connect events
                 while let Some(item) = ring_buf.next() {
                     let data = item.as_ref();
                     if data.len() >= std::mem::size_of::<ConnectEvent>() {
@@ -124,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
                         };
 
                         if container.is_some() || args.all {
-                            display_event(&event, container.as_ref());
+                            display_event(&event, container.as_ref(), &dns_cache).await;
                         }
                     }
                 }
@@ -135,7 +170,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn display_event(event: &ConnectEvent, container: Option<&ContainerInfo>) {
+async fn display_event(
+    event: &ConnectEvent,
+    container: Option<&ContainerInfo>,
+    dns_cache: &DnsCache,
+) {
     let comm = String::from_utf8_lossy(&event.comm)
         .trim_matches(char::from(0))
         .to_string();
@@ -146,17 +185,28 @@ fn display_event(event: &ConnectEvent, container: Option<&ContainerInfo>) {
         _ => "OTHER",
     };
 
-    let dst_str = if event.ip_version == 4 {
-        let ip = Ipv4Addr::new(
+    let dst_ip: IpAddr = if event.ip_version == 4 {
+        IpAddr::V4(Ipv4Addr::new(
             event.daddr[0],
             event.daddr[1],
             event.daddr[2],
             event.daddr[3],
-        );
-        format!("{}:{}", ip, event.dport)
+        ))
     } else {
-        let ip = Ipv6Addr::from(event.daddr);
-        format!("[{}]:{}", ip, event.dport)
+        IpAddr::V6(Ipv6Addr::from(event.daddr))
+    };
+
+    // Query per-cgroup DNS cache
+    let resolved_domain = dns_cache.resolve(event.cgroup_id, &dst_ip).await;
+
+    let dst_str = match resolved_domain {
+        Some(domain) => {
+            format!("\x1b[1;33m{}:{}\x1b[0m", domain, event.dport)
+        }
+        None => match dst_ip {
+            IpAddr::V4(ip) => format!("{}:{}", ip, event.dport),
+            IpAddr::V6(ip) => format!("[{}]:{}", ip, event.dport),
+        },
     };
 
     let time_str = format!("{:.3}s", (event.timestamp_ns as f64) / 1_000_000_000.0);
@@ -177,7 +227,7 @@ fn display_event(event: &ConnectEvent, container: Option<&ContainerInfo>) {
     };
 
     println!(
-        "{:<12} {:<33} {:<16} {:<29} {:<6} {:<30}",
+        "{:<12} {:<33} {:<16} {:<29} {:<6} {:<45}",
         time_str,
         container_col,
         service_col,

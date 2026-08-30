@@ -1,5 +1,7 @@
 #![no_std]
 
+pub const MAX_DNS_PAYLOAD: usize = 768;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ConnectEvent {
@@ -16,5 +18,17 @@ pub struct ConnectEvent {
     pub comm: [u8; 16],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DnsPacketEvent {
+    pub timestamp_ns: u64,
+    pub cgroup_id: u64,
+    pub len: u32,
+    pub payload: [u8; MAX_DNS_PAYLOAD],
+}
+
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for ConnectEvent {}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for DnsPacketEvent {}

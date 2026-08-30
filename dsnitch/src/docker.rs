@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
+    num::NonZeroUsize,
     os::unix::fs::MetadataExt,
     path::Path,
     sync::Arc,
@@ -12,6 +13,7 @@ use bollard::{
     Docker,
 };
 use futures_util::StreamExt;
+use lru::LruCache;
 use tokio::sync::RwLock;
 
 #[derive(Clone, Debug)]
@@ -29,6 +31,7 @@ pub struct ContainerInfo {
 pub struct DockerManager {
     docker: Docker,
     containers: Arc<RwLock<HashMap<u64, ContainerInfo>>>,
+    recently_stopped: Arc<RwLock<LruCache<u64, ContainerInfo>>>,
     id_to_cgroup: Arc<RwLock<HashMap<String, u64>>>,
 }
 
@@ -37,9 +40,12 @@ impl DockerManager {
         let docker = Docker::connect_with_unix_defaults()
             .context("Failed to connect to Docker daemon via /var/run/docker.sock")?;
 
+        let recent_cap = NonZeroUsize::new(256).unwrap();
+
         Ok(Self {
             docker,
             containers: Arc::new(RwLock::new(HashMap::new())),
+            recently_stopped: Arc::new(RwLock::new(LruCache::new(recent_cap))),
             id_to_cgroup: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -75,7 +81,7 @@ impl DockerManager {
     }
 
     /// Inspects a container, resolves its cgroup inode, and saves to cache
-    async fn inspect_and_cache(&self, container_id: &str) -> anyhow::Result<ContainerInfo> {
+    pub async fn inspect_and_cache(&self, container_id: &str) -> anyhow::Result<ContainerInfo> {
         let inspect = self
             .docker
             .inspect_container(container_id, None)
@@ -109,7 +115,19 @@ impl DockerManager {
             .and_then(|s| s.pid)
             .unwrap_or(0);
 
-        let cgroup_id = resolve_cgroup_id(pid, container_id)
+        let mut cgroup_id = resolve_cgroup_id(pid, container_id);
+        if cgroup_id.is_none() {
+            // Short retry loop for fast-starting containers
+            for _ in 0..5 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                cgroup_id = resolve_cgroup_id(pid, container_id);
+                if cgroup_id.is_some() {
+                    break;
+                }
+            }
+        }
+
+        let cgroup_id = cgroup_id
             .with_context(|| format!("Could not resolve cgroup_id for container {} (PID: {})", name, pid))?;
 
         let info = ContainerInfo {
@@ -133,7 +151,7 @@ impl DockerManager {
     }
 
     /// Background task listening to Docker daemon container lifecycle events
-    pub async fn start_event_listener(self: Arc<Self>) {
+    pub async fn start_event_listener(self: Arc<Self>, dns_cache: Option<Arc<crate::dns::DnsCache>>) {
         let mut filters = HashMap::new();
         filters.insert(
             "type".to_string(),
@@ -174,12 +192,10 @@ impl DockerManager {
 
                     match action {
                         "start" | "unpause" => {
-                            // Small sleep to ensure containerd/cgroups v2 hierarchy is populated
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                             match self.inspect_and_cache(actor_id).await {
                                 Ok(info) => {
-                                    println!(
-                                        "[DOCKER] Container started: {} (image: {}, cgroup: {})",
+                                    log::info!(
+                                        "Container started: {} (image: {}, cgroup: {})",
                                         info.name, info.image, info.cgroup_id
                                     );
                                 }
@@ -191,13 +207,27 @@ impl DockerManager {
                         "die" | "destroy" | "stop" | "kill" => {
                             let mut id_map = self.id_to_cgroup.write().await;
                             let mut c_map = self.containers.write().await;
+                            let mut recent = self.recently_stopped.write().await;
 
-                            if let Some(cgroup_id) = id_map.remove(actor_id) {
+                            let cgroup_opt = id_map.remove(actor_id).or_else(|| {
+                                c_map.iter().find(|(_, info)| info.id == actor_id).map(|(k, _)| *k)
+                            });
+
+                            if let Some(cgroup_id) = cgroup_opt {
                                 if let Some(info) = c_map.remove(&cgroup_id) {
-                                    println!(
-                                        "[DOCKER] Container stopped: {} (cgroup: {})",
+                                    log::info!(
+                                        "Container stopped: {} (cgroup: {})",
                                         info.name, cgroup_id
                                     );
+                                    recent.put(cgroup_id, info);
+
+                                    if let Some(ref dns) = dns_cache {
+                                        let dns_clone = Arc::clone(dns);
+                                        tokio::spawn(async move {
+                                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                                            dns_clone.evict_cgroup(cgroup_id).await;
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -212,20 +242,32 @@ impl DockerManager {
         }
     }
 
-    /// Fast synchronous lookup for eBPF event loop
+    /// Fast lookup checking active and recently stopped containers
     pub async fn lookup(&self, cgroup_id: u64) -> Option<ContainerInfo> {
-        self.containers.read().await.get(&cgroup_id).cloned()
+        if let Some(info) = self.containers.read().await.get(&cgroup_id) {
+            return Some(info.clone());
+        }
+        if let Some(info) = self.recently_stopped.write().await.get(&cgroup_id) {
+            return Some(info.clone());
+        }
+
+        // On-demand resolution fallback for ultrafast ephemeral containers
+        if let Some(id) = find_container_id_by_inode(cgroup_id) {
+            if let Ok(info) = self.inspect_and_cache(&id).await {
+                return Some(info);
+            }
+        }
+
+        None
     }
 }
 
 /// Resolves a container's 64-bit cgroup v2 inode ID (cgroup_id)
 pub fn resolve_cgroup_id(pid: i64, container_id: &str) -> Option<u64> {
-    // 1. Try resolving via /proc/<pid>/cgroup
     if pid > 0 {
         let proc_cgroup = format!("/proc/{}/cgroup", pid);
         if let Ok(content) = fs::read_to_string(&proc_cgroup) {
             for line in content.lines() {
-                // cgroup v2 single hierarchy entry format: "0::<path>"
                 if let Some(rel_path) = line.strip_prefix("0::") {
                     let full_path = format!("/sys/fs/cgroup{}", rel_path);
                     if let Ok(meta) = fs::metadata(&full_path) {
@@ -236,7 +278,6 @@ pub fn resolve_cgroup_id(pid: i64, container_id: &str) -> Option<u64> {
         }
     }
 
-    // 2. Direct fallback checks on common cgroups v2 paths
     let candidate_paths = [
         format!("/sys/fs/cgroup/system.slice/docker-{}.scope", container_id),
         format!("/sys/fs/cgroup/docker/{}", container_id),
@@ -249,6 +290,35 @@ pub fn resolve_cgroup_id(pid: i64, container_id: &str) -> Option<u64> {
         if path.exists() {
             if let Ok(meta) = fs::metadata(path) {
                 return Some(meta.ino());
+            }
+        }
+    }
+
+    None
+}
+
+/// Scans cgroup tree to find container ID corresponding to an inode
+fn find_container_id_by_inode(target_ino: u64) -> Option<String> {
+    let search_roots = [
+        "/sys/fs/cgroup/system.slice",
+        "/sys/fs/cgroup/docker",
+        "/sys/fs/cgroup",
+    ];
+
+    for root in &search_roots {
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.ino() == target_ino {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if let Some(id) = name.strip_prefix("docker-").and_then(|s| s.strip_suffix(".scope")) {
+                            return Some(id.to_string());
+                        }
+                        if root.ends_with("docker") {
+                            return Some(name);
+                        }
+                    }
+                }
             }
         }
     }
