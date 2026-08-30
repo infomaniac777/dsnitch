@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 aya = { workspace = true }
 aya-log = { workspace = true }
+bollard = { workspace = true }
+futures-util = { workspace = true }
 dsnitch-common = { path = "../dsnitch-common", features = ["user"] }
 tokio = { workspace = true }
 clap = { workspace = true }

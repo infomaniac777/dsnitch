@@ -1,7 +1,10 @@
+mod docker;
+
 use std::{
     fs::File,
     net::{Ipv4Addr, Ipv6Addr},
     path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 
@@ -13,6 +16,7 @@ use aya::{
     Ebpf,
 };
 use clap::Parser;
+use docker::{ContainerInfo, DockerManager};
 use dsnitch_common::ConnectEvent;
 use tokio::signal;
 
@@ -21,12 +25,16 @@ use tokio::signal;
     name = "dsnitch",
     author,
     version,
-    about = "Zero-overhead container network & DNS egress inspector"
+    about = "Zero-overhead Docker network & DNS egress inspector"
 )]
 struct Args {
     /// Cgroup v2 root path
     #[arg(long, default_value = "/sys/fs/cgroup")]
     cgroup_path: PathBuf,
+
+    /// Show host processes in addition to Docker containers
+    #[arg(long, short = 'a', default_value_t = false)]
+    all: bool,
 }
 
 #[tokio::main]
@@ -36,9 +44,34 @@ async fn main() -> anyhow::Result<()> {
 
     bump_memlock_rlimit()?;
 
-    println!("[INFO] Initializing dsnitch (Phase 1: Kernel Probe & Loader)...");
+    println!("\x1b[1;36m[dsnitch]\x1b[0m Initializing Docker Egress Inspector (Phase 2: Docker Integration)...");
     println!("[INFO] Target cgroup path: {}", args.cgroup_path.display());
 
+    // 1. Initialize Docker Engine synchronizer
+    let docker_mgr = match DockerManager::new() {
+        Ok(mgr) => {
+            let mgr = Arc::new(mgr);
+            match mgr.sync_running_containers().await {
+                Ok(count) => {
+                    println!("\x1b[1;32m[DOCKER]\x1b[0m Connected to Docker daemon (Active containers: {})", count);
+                }
+                Err(err) => {
+                    println!("\x1b[1;33m[WARN]\x1b[0m Could not list running containers: {:#}", err);
+                }
+            }
+            let listener_mgr = Arc::clone(&mgr);
+            tokio::spawn(async move {
+                listener_mgr.start_event_listener().await;
+            });
+            Some(mgr)
+        }
+        Err(err) => {
+            println!("\x1b[1;33m[WARN]\x1b[0m Docker not available: {:#}. Running in host-only mode.", err);
+            None
+        }
+    };
+
+    // 2. Load eBPF bytecode
     #[cfg(debug_assertions)]
     let bpf_bytes = include_bytes_aligned!("../../dsnitch-ebpf/target/bpfel-unknown-none/debug/dsnitch");
     #[cfg(not(debug_assertions))]
@@ -54,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
         let prog4: &mut CgroupSockAddr = prog.try_into()?;
         prog4.load()?;
         prog4.attach(&cgroup_file, CgroupAttachMode::Single)?;
-        println!("[SUCCESS] Attached connect4 probe to cgroup v2");
+        println!("\x1b[1;32m[SUCCESS]\x1b[0m Attached connect4 probe to cgroup v2");
     }
 
     // Attach IPv6 connect hook
@@ -62,15 +95,15 @@ async fn main() -> anyhow::Result<()> {
         let prog6: &mut CgroupSockAddr = prog.try_into()?;
         prog6.load()?;
         prog6.attach(&cgroup_file, CgroupAttachMode::Single)?;
-        println!("[SUCCESS] Attached connect6 probe to cgroup v2");
+        println!("\x1b[1;32m[SUCCESS]\x1b[0m Attached connect6 probe to cgroup v2");
     }
 
     // Open Ring Buffer map
     let ring_buf_map = ebpf.take_map("EVENTS").context("Map EVENTS not found in eBPF program")?;
     let mut ring_buf = RingBuf::try_from(ring_buf_map)?;
 
-    println!("\n{:<12} {:<18} {:<8} {:<16} {:<6} {:<45}", "TIME", "CGROUP_ID", "PID", "PROCESS", "PROTO", "DESTINATION");
-    println!("{}", "-".repeat(110));
+    println!("\n{:<12} {:<24} {:<16} {:<20} {:<6} {:<30}", "TIME", "CONTAINER", "SERVICE", "IMAGE/PROCESS", "PROTO", "DESTINATION");
+    println!("{}", "─".repeat(115));
 
     let mut interval = tokio::time::interval(Duration::from_millis(50));
     loop {
@@ -84,7 +117,15 @@ async fn main() -> anyhow::Result<()> {
                     let data = item.as_ref();
                     if data.len() >= std::mem::size_of::<ConnectEvent>() {
                         let event = unsafe { *(data.as_ptr() as *const ConnectEvent) };
-                        display_event(&event);
+                        let container = if let Some(ref mgr) = docker_mgr {
+                            mgr.lookup(event.cgroup_id).await
+                        } else {
+                            None
+                        };
+
+                        if container.is_some() || args.all {
+                            display_event(&event, container.as_ref());
+                        }
                     }
                 }
             }
@@ -94,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn display_event(event: &ConnectEvent) {
+fn display_event(event: &ConnectEvent, container: Option<&ContainerInfo>) {
     let comm = String::from_utf8_lossy(&event.comm)
         .trim_matches(char::from(0))
         .to_string();
@@ -120,12 +161,27 @@ fn display_event(event: &ConnectEvent) {
 
     let time_str = format!("{:.3}s", (event.timestamp_ns as f64) / 1_000_000_000.0);
 
+    let (container_col, service_col, image_col) = match container {
+        Some(info) => {
+            let name_display = format!("\x1b[1;32m{}\x1b[0m", info.name);
+            let service_display = info.compose_service.as_deref().unwrap_or("-").to_string();
+            let image_display = info.image.clone();
+            (name_display, service_display, image_display)
+        }
+        None => {
+            let name_display = "\x1b[90m[HOST]\x1b[0m".to_string();
+            let service_display = "-".to_string();
+            let image_display = format!("\x1b[90m{}\x1b[0m", comm);
+            (name_display, service_display, image_display)
+        }
+    };
+
     println!(
-        "{:<12} {:<18} {:<8} {:<16} {:<6} {:<45}",
+        "{:<12} {:<33} {:<16} {:<29} {:<6} {:<30}",
         time_str,
-        event.cgroup_id,
-        event.pid,
-        comm,
+        container_col,
+        service_col,
+        image_col,
         proto,
         dst_str
     );

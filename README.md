@@ -69,7 +69,7 @@ It provides instant attribution of all outbound Layer 4 connections (TCP/UDP) an
 
 ## 5. Development Phases
 
-1. **Phase 1 (Kernel Probe & Loader):** Write the minimal eBPF C program to capture outbound `connect()` events with `cgroup_id`, compile with CO-RE, and load it via userspace loader.
-2. **Phase 2 (Docker Integration):** Connect to `/var/run/docker.sock`, extract cgroup IDs for running containers, and correlate incoming kernel events with container names.
-3. **Phase 3 (DNS Enrichment):** Add DNS packet snooping to populate the local `IP -> Hostname` cache.
-4. **Phase 4 (TUI & Packaging):** Build the terminal UI layout (container selector, live connection table, search/filter) and package with static binary builds.
+1. ✅ **Phase 1 (Kernel Probe & Loader):** Pure Rust eBPF probe capturing outbound `connect()` events with `cgroup_id` via Aya, loaded via userspace async loader.
+2. ✅ **Phase 2 (Docker Integration):** Connect to `/var/run/docker.sock`, extract cgroup IDs for running containers, and correlate incoming kernel events with container names and Compose service labels.
+3. ⏳ **Phase 3 (DNS Enrichment):** Add DNS packet snooping to populate the local `IP -> Hostname` cache.
+4. ⏳ **Phase 4 (TUI & Packaging):** Build the terminal UI layout (container selector, live connection table, search/filter) and package with static binary builds.
