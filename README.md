@@ -23,25 +23,25 @@ It provides instant attribution of all outbound Layer 4 connections (TCP/UDP) an
 ```text
 [In-Kernel eBPF Layer]
   ├── Sockets / Connect Hook:
-  │     Attaches to cgroup v2 root for Docker (/sys/fs/cgroup/.../docker) via BPF_CGROUP_INET4_CONNECT
-  │     or hooks tracepoint/syscalls/sys_enter_connect with in-kernel cgroup hash map filter.
+  │     Attaches to cgroup v2 root (/sys/fs/cgroup) via BPF_CGROUP_INET4_CONNECT / INET6_CONNECT.
   │     Captures: cgroup_id, PID, src_ip, src_port, dst_ip, dst_port, protocol.
   ├── DNS Snooper:
-  │     Inspects UDP/53 DNS response payloads to extract (A/AAAA) IP-to-Domain mappings.
+  │     Inspects UDP/53 DNS response payloads with caller cgroup_id to extract (A/AAAA) records.
   └── In-Kernel Ring Buffer:
         Pushes compact event structs to a single BPF_MAP_TYPE_RINGBUF.
 
 ──────────────────────────────────────────── IPC (mmap / epoll) ─────────────
 
-[Userspace Daemon & TUI (Go / Rust)]
+[Userspace Daemon & TUI (Rust)]
   ├── Docker Engine Synchronizer:
   │     Queries /var/run/docker.sock to resolve cgroup_id <-> container_name / compose_service.
   │     Listens to Docker events (start/die) to update cgroup lookup tables dynamically.
-  ├── DNS Correlation Cache:
-  │     In-memory LRU cache matching raw outbound destination IPs to domain names.
+  ├── Per-Cgroup DNS Correlation Cache:
+  │     Isolated in-memory LRU cache per cgroup_id matching (cgroup_id, IP) -> domain name
+  │     to prevent cross-container CDN/Anycast IP aliasing.
   ├── Ring Buffer Ingestion Loop:
   │     Zero-copy consumer draining mmap'd ring buffer memory on epoll wakeup.
-  └── TUI View (Bubbletea / Ratatui):
+  └── TUI View (Ratatui):
         Interactive split-pane interface:
         - Left/Top: Active Docker containers with outbound connection counters & rates.
         - Right/Bottom: Live stream of outbound egress (Container -> Resolved Domain/IP:Port).
@@ -52,18 +52,17 @@ It provides instant attribution of all outbound Layer 4 connections (TCP/UDP) an
 ## 4. Technical Implementation Details
 
 ### A. eBPF Subsystem
-- **Kernel Probe:** C compiled to eBPF ELF bytecode using CO-RE (`vmlinux.h`).
+- **Kernel Probe:** Pure Rust eBPF probe (`aya-ebpf`) compiled to `bpfel-unknown-none`.
 - **Connection Interception:**
   - Read calling task cgroup ID via `bpf_get_current_cgroup_id()`.
-  - Extract destination IPv4/IPv6 and destination port from the socket context (`struct bpf_sock_addr` or `struct sockaddr_in`).
+  - Extract destination IPv4/IPv6 and destination port from socket context (`cgroup_sock_addr`).
 - **Data Transport:** Write event structs to ring buffer via `bpf_ringbuf_reserve()` -> `bpf_ringbuf_submit()`.
 
 ### B. Userspace Engine
-- **Recommended Stack:** 
-  - **Go:** `cilium/ebpf` (loader/CO-RE), `docker/docker/client`, `charmbracelet/bubbletea` (TUI), `miekg/dns` (DNS parsing).
-  - *OR* **Rust:** `aya` (eBPF), `bollard` (Docker), `ratatui` (TUI), `trust-dns-proto` / `hickory-dns`.
-- **Event Handling:** Ingestion worker runs on an `epoll` event loop sleeping on the ring buffer notification FD, waking up only to drain unconsumed ring buffer memory slots.
-- **Docker Mapping:** Polls initial container list on startup and subscribes to the Docker events stream (`/events`) to maintain an active map of `cgroup_id -> ContainerMetadata`.
+- **Stack:** **Rust** (`aya`, `bollard`, `ratatui`, `hickory-dns-proto` / `trust-dns-proto`, `tokio`).
+- **Event Handling:** Ingestion worker runs on an async event loop draining unconsumed ring buffer memory slots.
+- **Docker Mapping:** Polls initial container list on startup and subscribes to the Docker events stream (`/events`) to maintain an active map of `cgroup_id -> ContainerInfo`.
+- **Per-Cgroup DNS Resolution:** Maintains an isolated LRU cache per `cgroup_id` matching `(cgroup_id, IpAddr) -> DomainName` to prevent multi-tenant CDN/Anycast IP collisions.
 
 ---
 
@@ -71,5 +70,5 @@ It provides instant attribution of all outbound Layer 4 connections (TCP/UDP) an
 
 1. ✅ **Phase 1 (Kernel Probe & Loader):** Pure Rust eBPF probe capturing outbound `connect()` events with `cgroup_id` via Aya, loaded via userspace async loader.
 2. ✅ **Phase 2 (Docker Integration):** Connect to `/var/run/docker.sock`, extract cgroup IDs for running containers, and correlate incoming kernel events with container names and Compose service labels.
-3. ⏳ **Phase 3 (DNS Enrichment):** Add DNS packet snooping to populate the local `IP -> Hostname` cache.
+3. ⏳ **Phase 3 (DNS Enrichment):** Add DNS packet snooping to populate isolated per-cgroup `(cgroup_id, IP) -> Hostname` cache.
 4. ⏳ **Phase 4 (TUI & Packaging):** Build the terminal UI layout (container selector, live connection table, search/filter) and package with static binary builds.
