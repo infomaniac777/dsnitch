@@ -1,0 +1,23 @@
+# Build targets
+target/
+**/target/
+
+# Object and binary temporary artifacts
+*.o
+*.so
+*.dylib
+*.dll
+*.bin
+*.elf
+
+# Editor and temporary files
+**/*.rs.bk
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs & environments
+*.log
+.env
+.env.*

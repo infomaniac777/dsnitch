@@ -1,0 +1,15 @@
+[package]
+name = "dsnitch"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya = { workspace = true }
+aya-log = { workspace = true }
+dsnitch-common = { path = "../dsnitch-common", features = ["user"] }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+libc = { workspace = true }
