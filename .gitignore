@@ -1,6 +1,7 @@
 # Build targets
 target/
 **/target/
+bin/
 
 # Object and binary temporary artifacts
 *.o
