@@ -10,6 +10,8 @@ bollard = { workspace = true }
 futures-util = { workspace = true }
 hickory-proto = { workspace = true }
 lru = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
 dsnitch-common = { path = "../dsnitch-common", features = ["user"] }
 tokio = { workspace = true }
 clap = { workspace = true }

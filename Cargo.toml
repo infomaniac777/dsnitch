@@ -17,6 +17,8 @@ bollard = "0.21.1"
 futures-util = "0.3"
 hickory-proto = "0.25.2"
 lru = "0.18.3"
+ratatui = "0.29"
+crossterm = "0.28"
 tokio = { version = "1.43", features = ["full"] }
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"

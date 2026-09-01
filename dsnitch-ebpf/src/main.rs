@@ -7,12 +7,12 @@ use aya_ebpf::{
         bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
         bpf_get_current_uid_gid, bpf_ktime_get_ns, bpf_skb_cgroup_id,
     },
-    macros::{cgroup_skb, cgroup_sock_addr, map},
+    macros::{cgroup_skb, cgroup_sock_addr, map, tracepoint},
     maps::RingBuf,
-    programs::{SkBuffContext, SockAddrContext},
+    programs::{SkBuffContext, SockAddrContext, TracePointContext},
     EbpfContext,
 };
-use dsnitch_common::{ConnectEvent, DnsPacketEvent, MAX_DNS_PAYLOAD};
+use dsnitch_common::{ConnectEvent, DnsPacketEvent, SocketCloseEvent, MAX_DNS_PAYLOAD};
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
@@ -20,11 +20,24 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 #[map]
 static DNS_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
+#[map]
+static CLOSE_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
 #[cgroup_sock_addr(connect4)]
 pub fn dsnitch_connect4(ctx: SockAddrContext) -> i32 {
     let sock_addr = ctx.sock_addr as *const bpf_sock_addr;
     if sock_addr.is_null() {
         return 1;
+    }
+
+    let user_ip4 = unsafe { (*sock_addr).user_ip4 };
+    let user_port = unsafe { (*sock_addr).user_port };
+    let mut protocol = unsafe { (*sock_addr).protocol } as u8;
+
+    // Detect ICMP / RAW sockets
+    let sk_type = unsafe { (*sock_addr).type_ };
+    if protocol == 1 || (sk_type == 3 && protocol == 0) {
+        protocol = 1; // IPPROTO_ICMP
     }
 
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
@@ -39,10 +52,6 @@ pub fn dsnitch_connect4(ctx: SockAddrContext) -> i32 {
         Err(_) => [0u8; 16],
     };
 
-    let user_ip4 = unsafe { (*sock_addr).user_ip4 };
-    let user_port = unsafe { (*sock_addr).user_port };
-    let protocol = unsafe { (*sock_addr).protocol };
-
     let ip_bytes = user_ip4.to_ne_bytes();
     let mut daddr = [0u8; 16];
     daddr[0] = ip_bytes[0];
@@ -52,16 +61,27 @@ pub fn dsnitch_connect4(ctx: SockAddrContext) -> i32 {
 
     let dport = u16::from_be(user_port as u16);
 
+    // Skip TCP sockets (handled exclusively by inet_sock_set_state with real skaddr)
+    if protocol == 6 {
+        return 1;
+    }
+
+    // Skip internal glibc/kernel route lookup dummy connects (UDP with port 0)
+    if protocol == 17 && dport == 0 {
+        return 1;
+    }
+
     let event = ConnectEvent {
         timestamp_ns,
         cgroup_id,
+        skaddr: 0,
         pid,
         uid,
         saddr: [0u8; 16],
         daddr,
         sport: 0,
         dport,
-        proto: protocol as u8,
+        proto: protocol,
         ip_version: 4,
         comm,
     };
@@ -81,6 +101,15 @@ pub fn dsnitch_connect6(ctx: SockAddrContext) -> i32 {
         return 1;
     }
 
+    let user_ip6 = unsafe { (*sock_addr).user_ip6 };
+    let user_port = unsafe { (*sock_addr).user_port };
+    let mut protocol = unsafe { (*sock_addr).protocol } as u8;
+
+    let sk_type = unsafe { (*sock_addr).type_ };
+    if protocol == 58 || (sk_type == 3 && protocol == 0) {
+        protocol = 58; // IPPROTO_ICMPV6
+    }
+
     let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
     let pid_tgid = bpf_get_current_pid_tgid();
     let pid = (pid_tgid >> 32) as u32;
@@ -92,10 +121,6 @@ pub fn dsnitch_connect6(ctx: SockAddrContext) -> i32 {
         Ok(c) => c,
         Err(_) => [0u8; 16],
     };
-
-    let user_ip6 = unsafe { (*sock_addr).user_ip6 };
-    let user_port = unsafe { (*sock_addr).user_port };
-    let protocol = unsafe { (*sock_addr).protocol };
 
     let b0 = user_ip6[0].to_ne_bytes();
     let b1 = user_ip6[1].to_ne_bytes();
@@ -111,16 +136,27 @@ pub fn dsnitch_connect6(ctx: SockAddrContext) -> i32 {
 
     let dport = u16::from_be(user_port as u16);
 
+    // Skip TCP sockets (handled exclusively by inet_sock_set_state with real skaddr)
+    if protocol == 6 {
+        return 1;
+    }
+
+    // Skip internal glibc/kernel route lookup dummy connects (UDP with port 0)
+    if protocol == 17 && dport == 0 {
+        return 1;
+    }
+
     let event = ConnectEvent {
         timestamp_ns,
         cgroup_id,
+        skaddr: 0,
         pid,
         uid,
         saddr: [0u8; 16],
         daddr,
         sport: 0,
         dport,
-        proto: protocol as u8,
+        proto: protocol,
         ip_version: 6,
         comm,
     };
@@ -133,10 +169,144 @@ pub fn dsnitch_connect6(ctx: SockAddrContext) -> i32 {
     1
 }
 
+#[tracepoint]
+pub fn dsnitch_sock_set_state(ctx: TracePointContext) -> u32 {
+    let _ = try_sock_set_state(&ctx);
+    0
+}
+
+#[inline(always)]
+fn try_sock_set_state(ctx: &TracePointContext) -> Result<(), ()> {
+    let skaddr: u64 = unsafe { ctx.read_at(8).map_err(|_| ())? };
+    let newstate: i32 = unsafe { ctx.read_at(20).map_err(|_| ())? };
+
+    let family: u16 = unsafe { ctx.read_at(28).map_err(|_| ())? };
+    let protocol: u16 = unsafe { ctx.read_at(30).map_err(|_| ())? };
+    let sport: u16 = unsafe { ctx.read_at(24).map_err(|_| ())? };
+    let dport: u16 = unsafe { ctx.read_at(26).map_err(|_| ())? };
+
+    let cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+    let timestamp_ns = unsafe { bpf_ktime_get_ns() };
+
+    let comm = match bpf_get_current_comm() {
+        Ok(c) => c,
+        Err(_) => [0u8; 16],
+    };
+
+    // 1. TCP Connection Initiation (SYN_SENT = 2)
+    if newstate == 2 {
+        if family == 2 {
+            let saddr4: [u8; 4] = unsafe { ctx.read_at(32).map_err(|_| ())? };
+            let daddr4: [u8; 4] = unsafe { ctx.read_at(36).map_err(|_| ())? };
+
+            let mut saddr = [0u8; 16];
+            let mut daddr = [0u8; 16];
+            saddr[0..4].copy_from_slice(&saddr4);
+            daddr[0..4].copy_from_slice(&daddr4);
+
+            let event = ConnectEvent {
+                timestamp_ns,
+                cgroup_id,
+                skaddr,
+                pid: 0,
+                uid: 0,
+                saddr,
+                daddr,
+                sport,
+                dport,
+                proto: 6, // TCP
+                ip_version: 4,
+                comm,
+            };
+
+            if let Some(mut entry) = EVENTS.reserve::<ConnectEvent>(0) {
+                entry.write(event);
+                entry.submit(0);
+            }
+        } else if family == 10 {
+            let saddr_v6: [u8; 16] = unsafe { ctx.read_at(40).map_err(|_| ())? };
+            let daddr_v6: [u8; 16] = unsafe { ctx.read_at(56).map_err(|_| ())? };
+
+            let event = ConnectEvent {
+                timestamp_ns,
+                cgroup_id,
+                skaddr,
+                pid: 0,
+                uid: 0,
+                saddr: saddr_v6,
+                daddr: daddr_v6,
+                sport,
+                dport,
+                proto: 6,
+                ip_version: 6,
+                comm,
+            };
+
+            if let Some(mut entry) = EVENTS.reserve::<ConnectEvent>(0) {
+                entry.write(event);
+                entry.submit(0);
+            }
+        }
+        return Ok(());
+    }
+
+    // 2. TCP Connection Termination (TCP_CLOSE = 7, TCP_TIME_WAIT = 6)
+    if newstate == 7 || newstate == 6 {
+        if family == 2 {
+            let saddr4: [u8; 4] = unsafe { ctx.read_at(32).map_err(|_| ())? };
+            let daddr4: [u8; 4] = unsafe { ctx.read_at(36).map_err(|_| ())? };
+
+            let mut saddr = [0u8; 16];
+            let mut daddr = [0u8; 16];
+            saddr[0..4].copy_from_slice(&saddr4);
+            daddr[0..4].copy_from_slice(&daddr4);
+
+            let event = SocketCloseEvent {
+                timestamp_ns,
+                cgroup_id,
+                skaddr,
+                saddr,
+                daddr,
+                sport,
+                dport,
+                proto: protocol as u8,
+                ip_version: 4,
+            };
+
+            if let Some(mut entry) = CLOSE_EVENTS.reserve::<SocketCloseEvent>(0) {
+                entry.write(event);
+                entry.submit(0);
+            }
+        } else if family == 10 {
+            let saddr_v6: [u8; 16] = unsafe { ctx.read_at(40).map_err(|_| ())? };
+            let daddr_v6: [u8; 16] = unsafe { ctx.read_at(56).map_err(|_| ())? };
+
+            let event = SocketCloseEvent {
+                timestamp_ns,
+                cgroup_id,
+                skaddr,
+                saddr: saddr_v6,
+                daddr: daddr_v6,
+                sport,
+                dport,
+                proto: protocol as u8,
+                ip_version: 6,
+            };
+
+            if let Some(mut entry) = CLOSE_EVENTS.reserve::<SocketCloseEvent>(0) {
+                entry.write(event);
+                entry.submit(0);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cgroup_skb(ingress)]
 pub fn dsnitch_dns_ingress(ctx: SkBuffContext) -> i32 {
     let _ = try_dns_packet(&ctx);
-    1 // 1 = allow packet to pass through
+    1
 }
 
 #[cgroup_skb(egress)]
@@ -153,8 +323,50 @@ fn try_dns_packet(ctx: &SkBuffContext) -> Result<(), ()> {
     let (payload_offset, payload_len) = if version == 4 {
         let ihl = ((ver_ihl & 0x0f) * 4) as usize;
         let proto = ctx.load::<u8>(9).map_err(|_| ())?;
+
+        // Canonical Layer-3 ICMPv4 inspection (RFC 791, Protocol 1)
+        if proto == 1 {
+            let d0 = ctx.load::<u8>(16).map_err(|_| ())?;
+            let d1 = ctx.load::<u8>(17).map_err(|_| ())?;
+            let d2 = ctx.load::<u8>(18).map_err(|_| ())?;
+            let d3 = ctx.load::<u8>(19).map_err(|_| ())?;
+
+            let mut daddr = [0u8; 16];
+            daddr[0] = d0;
+            daddr[1] = d1;
+            daddr[2] = d2;
+            daddr[3] = d3;
+
+            let mut cgroup_id = unsafe { bpf_skb_cgroup_id(ctx.as_ptr() as *mut _) };
+            if cgroup_id == 0 {
+                cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+            }
+            let timestamp_ns = unsafe { bpf_ktime_get_ns() };
+
+            let event = ConnectEvent {
+                timestamp_ns,
+                cgroup_id,
+                skaddr: 0,
+                pid: 0,
+                uid: 0,
+                saddr: [0u8; 16],
+                daddr,
+                sport: 0,
+                dport: 0,
+                proto: 1, // IPPROTO_ICMP
+                ip_version: 4,
+                comm: [0u8; 16],
+            };
+
+            if let Some(mut entry) = EVENTS.reserve::<ConnectEvent>(0) {
+                entry.write(event);
+                entry.submit(0);
+            }
+            return Ok(());
+        }
+
         if proto != 17 {
-            return Ok(()); // not UDP
+            return Ok(());
         }
 
         let p0 = ctx.load::<u8>(ihl).map_err(|_| ())? as u16;
@@ -170,12 +382,52 @@ fn try_dns_packet(ctx: &SkBuffContext) -> Result<(), ()> {
         let udp_len = (l0 << 8) | l1;
 
         if src_port != 53 && dst_port != 53 {
-            return Ok(()); // not DNS
+            return Ok(());
         }
         let p_len = if udp_len > 8 { udp_len - 8 } else { 0 };
         (ihl + 8, p_len)
     } else if version == 6 {
         let proto = ctx.load::<u8>(6).map_err(|_| ())?;
+
+        // Canonical Layer-3 ICMPv6 inspection (RFC 8200, NextHeader 58)
+        if proto == 58 {
+            let mut daddr = [0u8; 16];
+            let mut i = 0;
+            while i < 16 {
+                if let Ok(b) = ctx.load::<u8>(24 + i) {
+                    daddr[i] = b;
+                }
+                i += 1;
+            }
+
+            let mut cgroup_id = unsafe { bpf_skb_cgroup_id(ctx.as_ptr() as *mut _) };
+            if cgroup_id == 0 {
+                cgroup_id = unsafe { bpf_get_current_cgroup_id() };
+            }
+            let timestamp_ns = unsafe { bpf_ktime_get_ns() };
+
+            let event = ConnectEvent {
+                timestamp_ns,
+                cgroup_id,
+                skaddr: 0,
+                pid: 0,
+                uid: 0,
+                saddr: [0u8; 16],
+                daddr,
+                sport: 0,
+                dport: 0,
+                proto: 58, // IPPROTO_ICMPV6
+                ip_version: 6,
+                comm: [0u8; 16],
+            };
+
+            if let Some(mut entry) = EVENTS.reserve::<ConnectEvent>(0) {
+                entry.write(event);
+                entry.submit(0);
+            }
+            return Ok(());
+        }
+
         if proto != 17 {
             return Ok(());
         }
