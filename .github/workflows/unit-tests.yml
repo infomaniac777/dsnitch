@@ -1,0 +1,41 @@
+name: Unit Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1. Install Rust toolchains
+      - name: Install Nightly Rust (with rust-src)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install Stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install bpf-linker
+        uses: taiki-e/install-action@v2
+        with:
+          tool: bpf-linker
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: unit-tests
+
+      # 2. Build eBPF Bytecode (needed by compile-time include_bytes_aligned!)
+      - name: Build eBPF Bytecode
+        run: cargo xtask build-ebpf
+
+      # 3. Run Unit Tests
+      - name: Run Unit Tests
+        run: cargo test --package dsnitch

@@ -570,3 +570,113 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     let paragraph = Paragraph::new(footer_line).block(block);
     frame.render_widget(paragraph, area);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_connection(key: &str, skaddr: u64, cgroup_id: u64, proto: &str) -> ConnectionItem {
+        ConnectionItem {
+            key: key.to_string(),
+            skaddr,
+            time_str: "1.000s".to_string(),
+            container_name: "test-container".to_string(),
+            service: "web".to_string(),
+            image: "alpine".to_string(),
+            proto: proto.to_string(),
+            destination: "example.com:80".to_string(),
+            dst_ip_str: "93.184.216.34:80".to_string(),
+            is_docker: true,
+            cgroup_id,
+            status: ConnectionStatus::Active,
+            closed_at: None,
+            last_seen: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn test_app_add_and_close_by_skaddr() {
+        let mut app = App::new(false, 5);
+        let skaddr = 0xffff8801_12345678;
+
+        let conn = make_test_connection("conn-1", skaddr, 100, "TCP");
+        app.add_connection(conn);
+
+        assert_eq!(app.connections.len(), 1);
+        assert_eq!(app.connections[0].status, ConnectionStatus::Active);
+        assert!(app.connections[0].closed_at.is_none());
+
+        // Close using matching skaddr
+        app.close_connection(skaddr, "93.184.216.34:80");
+
+        assert_eq!(app.connections[0].status, ConnectionStatus::Closed);
+        assert!(app.connections[0].closed_at.is_some());
+    }
+
+    #[test]
+    fn test_app_udp_inactivity_auto_close() {
+        let mut app = App::new(false, 5);
+        let mut conn = make_test_connection("conn-udp", 0, 100, "UDP");
+        // Simulate 4 seconds of silence
+        conn.last_seen = Instant::now() - Duration::from_secs(4);
+        app.add_connection(conn);
+        // add_connection resets last_seen to now(), manually adjust it for test
+        app.connections[0].last_seen = Instant::now() - Duration::from_secs(4);
+
+        assert_eq!(app.connections[0].status, ConnectionStatus::Active);
+
+        // Pruning cycle should auto-close UDP after 3s inactivity
+        app.prune_expired();
+
+        assert_eq!(app.connections[0].status, ConnectionStatus::Closed);
+        assert!(app.connections[0].closed_at.is_some());
+    }
+
+    #[test]
+    fn test_app_prune_expired_grace_period() {
+        let mut app = App::new(false, 2); // 2 second grace period
+        let conn = make_test_connection("conn-closed", 0, 100, "TCP");
+        app.add_connection(conn);
+
+        // Mark as closed 5 seconds ago (past the 2s grace period)
+        app.connections[0].status = ConnectionStatus::Closed;
+        app.connections[0].closed_at = Some(Instant::now() - Duration::from_secs(5));
+
+        app.prune_expired();
+
+        // Connection should be pruned
+        assert!(app.connections.is_empty());
+    }
+
+    #[test]
+    fn test_app_max_connections_deque_limit() {
+        let mut app = App::new(false, 5);
+        app.max_connections = 5;
+
+        for i in 0..10 {
+            let key = format!("conn-{}", i);
+            app.add_connection(make_test_connection(&key, i, 100, "TCP"));
+        }
+
+        assert_eq!(app.connections.len(), 5);
+        // Newest connection should be at the back
+        assert_eq!(app.connections.back().unwrap().key, "conn-9");
+    }
+
+    #[test]
+    fn test_app_container_locking() {
+        let mut app = App::new(false, 5);
+        app.update_container(101, "auth-service".to_string(), "auth".to_string(), "alpine".to_string());
+        app.update_container(102, "web-service".to_string(), "web".to_string(), "nginx".to_string());
+
+        assert_eq!(app.sorted_containers.len(), 2);
+
+        // Lock to first container
+        app.selected_cgroup_filter = Some(101);
+        assert_eq!(app.selected_cgroup_filter, Some(101));
+
+        // Unlock
+        app.selected_cgroup_filter = None;
+        assert_eq!(app.selected_cgroup_filter, None);
+    }
+}

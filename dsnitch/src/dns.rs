@@ -132,3 +132,97 @@ impl DnsCache {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dsnitch_common::MAX_DNS_PAYLOAD;
+
+    fn build_mock_dns_response(domain: &str, ip: [u8; 4], ttl: u32) -> Vec<u8> {
+        let mut packet = Vec::new();
+        // Transaction ID
+        packet.extend_from_slice(&[0x12, 0x34]);
+        // Flags: Standard query response, No error (0x8180)
+        packet.extend_from_slice(&[0x81, 0x80]);
+        // QDCOUNT = 1
+        packet.extend_from_slice(&[0x00, 0x01]);
+        // ANCOUNT = 1
+        packet.extend_from_slice(&[0x00, 0x01]);
+        // NSCOUNT = 0, ARCOUNT = 0
+        packet.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+        // QNAME
+        for part in domain.split('.') {
+            packet.push(part.len() as u8);
+            packet.extend_from_slice(part.as_bytes());
+        }
+        packet.push(0x00); // Root label
+
+        // QTYPE = A (1), QCLASS = IN (1)
+        packet.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+
+        // Answer section: Name compression pointer to offset 12
+        packet.extend_from_slice(&[0xc0, 0x0c]);
+        // TYPE = A (1), CLASS = IN (1)
+        packet.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        // TTL
+        packet.extend_from_slice(&ttl.to_be_bytes());
+        // RDLENGTH = 4
+        packet.extend_from_slice(&[0x00, 0x04]);
+        // RDATA
+        packet.extend_from_slice(&ip);
+
+        packet
+    }
+
+    #[tokio::test]
+    async fn test_dns_cache_process_and_resolve() {
+        let cache = DnsCache::new(10);
+        let cgroup_id = 42;
+        let domain = "api.github.com";
+        let ip_bytes = [20, 207, 73, 85];
+        let ip = IpAddr::V4(std::net::Ipv4Addr::new(20, 207, 73, 85));
+
+        let wire_data = build_mock_dns_response(domain, ip_bytes, 120);
+
+        let mut event = DnsPacketEvent {
+            timestamp_ns: 1000,
+            cgroup_id,
+            len: wire_data.len() as u32,
+            payload: [0u8; MAX_DNS_PAYLOAD],
+        };
+        event.payload[..wire_data.len()].copy_from_slice(&wire_data);
+
+        // Before caching
+        assert_eq!(cache.resolve(cgroup_id, &ip).await, None);
+
+        // Process packet
+        cache.process_packet(&event).await;
+
+        // Resolve after caching
+        let resolved = cache.resolve(cgroup_id, &ip).await;
+        assert_eq!(resolved, Some("api.github.com".to_string()));
+
+        // Fallback resolution from another cgroup
+        let fallback_cgroup = 999;
+        let resolved_fallback = cache.resolve(fallback_cgroup, &ip).await;
+        assert_eq!(resolved_fallback, Some("api.github.com".to_string()));
+
+        // Evict cgroup
+        cache.evict_cgroup(cgroup_id).await;
+        assert_eq!(cache.resolve(cgroup_id, &ip).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_dns_cache_empty_packet_ignored() {
+        let cache = DnsCache::new(10);
+        let event = DnsPacketEvent {
+            timestamp_ns: 1000,
+            cgroup_id: 1,
+            len: 0,
+            payload: [0u8; MAX_DNS_PAYLOAD],
+        };
+        cache.process_packet(&event).await;
+        assert_eq!(cache.resolve(1, &IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1))).await, None);
+    }
+}

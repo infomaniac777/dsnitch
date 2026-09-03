@@ -2,6 +2,8 @@
 
 [![CI (x86_64)](https://github.com/infomaniac777/dsnitch/actions/workflows/ci-x86.yml/badge.svg)](https://github.com/infomaniac777/dsnitch/actions/workflows/ci-x86.yml)
 [![CI (aarch64)](https://github.com/infomaniac777/dsnitch/actions/workflows/ci-arm.yml/badge.svg)](https://github.com/infomaniac777/dsnitch/actions/workflows/ci-arm.yml)
+[![Unit Tests](https://github.com/infomaniac777/dsnitch/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/infomaniac777/dsnitch/actions/workflows/unit-tests.yml)
+[![E2E Tests](https://github.com/infomaniac777/dsnitch/actions/workflows/e2e.yml/badge.svg)](https://github.com/infomaniac777/dsnitch/actions/workflows/e2e.yml)
 
 A single-binary, lightweight, zero-configuration, real-time terminal UI (TUI) network and DNS egress inspector for Docker containers powered by modern Linux eBPF.
 
@@ -164,134 +166,16 @@ sudo ./target/release/dsnitch -a -s
 
 ---
 
-## Testing & Verification Suite
+## Testing
 
-The following test suite was executed against `dsnitch` to verify correctness across edge cases:
+`dsnitch` includes both in-memory unit tests and an automated end-to-end integration test suite that runs against live Docker containers:
 
-### Test 1: Multi-Container Docker Compose Stack Simulation
-Simulates multiple concurrent services with Docker Compose project and service labels:
 ```bash
-# Run in background: sudo ./target/release/dsnitch -s
-docker run --rm --name shop-gateway -l com.docker.compose.project=shop -l com.docker.compose.service=gateway alpine sh -c "wget -q -O /dev/null https://api.github.com && sleep 1 && wget -q -O /dev/null http://example.com" &
-docker run --rm --name shop-auth -l com.docker.compose.project=shop -l com.docker.compose.service=auth alpine sh -c "wget -q -O /dev/null https://registry.npmjs.org" &
-docker run --rm --name shop-probe -l com.docker.compose.project=shop -l com.docker.compose.service=probe alpine sh -c "ping -c 2 1.1.1.1" &
-wait
-```
+# Run in-memory unit tests:
+cargo test
 
-**Captured Output:**
-```text
-STATUS     TIME         CONTAINER       SERVICE    IMAGE/PROCESS    PROTO  DESTINATION             DST IP                  
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-● ACTIVE   6080.470s    shop-probe      probe      alpine           ICMP   -                       1.1.1.1                 
-● ACTIVE   6080.492s    shop-gateway    gateway    alpine           TCP    api.github.com:443      20.207.73.85:443        
-● ACTIVE   6080.498s    shop-auth       auth       alpine           TCP    registry.npmjs.org:443  104.16.4.34:443         
-○ CLOSED   6080.592s    shop-auth       auth       alpine           TCP    registry.npmjs.org:443  104.16.4.34:443         
-○ CLOSED   6080.631s    shop-gateway    gateway    alpine           TCP    api.github.com:443      20.207.73.85:443        
-● ACTIVE   6081.661s    shop-gateway    gateway    alpine           TCP    example.com:80          172.66.147.243:80       
-○ CLOSED   6081.713s    shop-gateway    gateway    alpine           TCP    example.com:80          172.66.147.243:80       
-```
-
----
-
-### Test 2: High Concurrency Burst (20 Parallel Sockets)
-Verifies `skaddr` collision resistance and ring buffer throughput under concurrent load:
-```bash
-docker run --rm --name burst-tester alpine sh -c '
-for i in $(seq 1 20); do
-  wget -q -O /dev/null http://example.com &
-done
-wait
-'
-```
-
-**Captured Output (Summary):**
-```text
-● ACTIVE   6103.914s    burst-tester    -          alpine           TCP    example.com:80          104.20.23.154:80  [x20]
-○ CLOSED   6103.952s    burst-tester    -          alpine           TCP    example.com:80          104.20.23.154:80  [x20]
-```
-
----
-
-### Test 3: User-Defined Bridge Network & Embedded DNS (`127.0.0.11`)
-Verifies DNS resolution and packet snooping inside custom Docker bridge network namespaces:
-```bash
-docker network create test-net
-docker run --rm --network test-net --name bridge-worker alpine wget -q -O /dev/null https://httpbin.org/ip
-docker network rm test-net
-```
-
-**Captured Output:**
-```text
-STATUS     TIME         CONTAINER       SERVICE    IMAGE/PROCESS    PROTO  DESTINATION             DST IP                  
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-● ACTIVE   6125.709s    bridge-worker   -          alpine           TCP    httpbin.org:443         100.63.40.118:443       
-○ CLOSED   6127.305s    bridge-worker   -          alpine           TCP    httpbin.org:443         100.63.40.118:443       
-```
-
----
-
-### Test 4: Rapid Container Churn & Lifecycle Races
-Verifies that containers exiting in sub-second intervals are correctly resolved via the `recently_stopped` cache:
-```bash
-for i in $(seq 1 6); do
-  docker run --rm --name "churn-$i" alpine wget -q -O /dev/null http://example.com &
-done
-wait
-```
-
-**Captured Output:**
-```text
-STATUS     TIME         CONTAINER       SERVICE    IMAGE/PROCESS    PROTO  DESTINATION             DST IP                  
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-● ACTIVE   6148.707s    churn-2         -          alpine           TCP    example.com:80          172.66.147.243:80       
-○ CLOSED   6148.761s    churn-2         -          alpine           TCP    example.com:80          172.66.147.243:80       
-● ACTIVE   6148.795s    churn-1         -          alpine           TCP    example.com:80          172.66.147.243:80       
-● ACTIVE   6148.819s    churn-5         -          alpine           TCP    example.com:80          172.66.147.243:80       
-● ACTIVE   6148.819s    churn-6         -          alpine           TCP    example.com:80          172.66.147.243:80       
-● ACTIVE   6148.819s    churn-4         -          alpine           TCP    example.com:80          172.66.147.243:80       
-○ CLOSED   6148.841s    churn-1         -          alpine           TCP    example.com:80          172.66.147.243:80       
-○ CLOSED   6148.861s    churn-5         -          alpine           TCP    example.com:80          172.66.147.243:80       
-○ CLOSED   6148.863s    churn-6         -          alpine           TCP    example.com:80          172.66.147.243:80       
-○ CLOSED   6148.864s    churn-4         -          alpine           TCP    example.com:80          172.66.147.243:80       
-● ACTIVE   6148.856s    churn-3         -          alpine           TCP    example.com:80          172.66.147.243:80       
-○ CLOSED   6148.901s    churn-3         -          alpine           TCP    example.com:80          172.66.147.243:80       
-```
-
----
-
-### Test 5: Host Traffic Isolation
-Verifies that host traffic is strictly omitted when running in default container mode:
-```bash
-wget -q -O /dev/null http://example.com  # Host traffic (omitted)
-docker run --rm --name container-only alpine wget -q -O /dev/null http://example.com
-```
-
-**Captured Output:**
-```text
-STATUS     TIME         CONTAINER       SERVICE    IMAGE/PROCESS    PROTO  DESTINATION             DST IP                  
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-● ACTIVE   6165.890s    container-only  -          alpine           TCP    example.com:80          104.20.23.154:80        
-○ CLOSED   6165.937s    container-only  -          alpine           TCP    example.com:80          104.20.23.154:80        
-```
-
----
-
-### Test 6: Multi-Hop CNAME Chaining & CDNs
-Verifies full recursive CNAME resolution to edge Anycast IPs:
-```bash
-docker run --rm --name cname-tester alpine sh -c "wget -q -O /dev/null https://cdnjs.cloudflare.com && wget -q -O /dev/null https://reddit.com"
-```
-
-**Captured Output:**
-```text
-STATUS     TIME         CONTAINER       SERVICE    IMAGE/PROCESS    PROTO  DESTINATION             DST IP                  
-───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-● ACTIVE   6192.024s    cname-tester    -          alpine           TCP    cdnjs.cloudflare.com:443 104.17.24.14:443       
-○ CLOSED   6192.092s    cname-tester    -          alpine           TCP    cdnjs.cloudflare.com:443 104.17.24.14:443        
-● ACTIVE   6192.121s    cname-tester    -          alpine           TCP    reddit.com:443          151.101.65.140:443      
-○ CLOSED   6192.185s    cname-tester    -          alpine           TCP    reddit.com:443          151.101.65.140:443      
-● ACTIVE   6192.243s    cname-tester    -          alpine           TCP    www.reddit.com:443      151.101.65.140:443      
-○ CLOSED   6192.325s    cname-tester    -          alpine           TCP    www.reddit.com:443      151.101.65.140:443      
+# Run automated E2E integration suite (Docker required):
+sudo bash tests/e2e.sh
 ```
 
 ---
@@ -322,7 +206,7 @@ Options:
      ```
    - Alternatively, grant explicit Linux capabilities without full root:
      ```bash
-     sudo setcap cap_bpf,cap_perfmon,cap_net_admin+ep ./target/release/dsnitch
+     sudo setcap cap_sys_admin,cap_net_admin,cap_dac_read_search+ep ./target/release/dsnitch
      ```
    - Requires read access to the Docker daemon socket (`/var/run/docker.sock`) and unified cgroup v2 hierarchy (`/sys/fs/cgroup`).
 2. **Passive Read-Only Safety**: All in-kernel eBPF probes inspect socket and packet headers without blocking, redirecting, or dropping packets (`return 1`), guaranteeing host network stability.

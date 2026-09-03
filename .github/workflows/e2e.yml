@@ -1,0 +1,42 @@
+name: E2E Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  e2e:
+    name: Docker E2E Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1. Install Rust toolchains
+      - name: Install Nightly Rust (with rust-src)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install Stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install bpf-linker
+        uses: taiki-e/install-action@v2
+        with:
+          tool: bpf-linker
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      # 2. Build Bytecode & Binary
+      - name: Build eBPF Bytecode
+        run: cargo xtask build-ebpf --release
+
+      - name: Build dsnitch Release
+        run: cargo build --release
+
+      # 3. Run Automated E2E Test Suite with Docker
+      - name: Run E2E Tests
+        run: bash tests/e2e.sh
