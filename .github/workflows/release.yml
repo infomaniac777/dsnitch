@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-x86:
+    name: Build Release (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nightly Rust (with rust-src)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install Stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install bpf-linker
+        uses: taiki-e/install-action@v2
+        with:
+          tool: bpf-linker
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-x86_64
+
+      - name: Build eBPF Bytecode
+        run: cargo xtask build-ebpf --release
+
+      - name: Build dsnitch Release (x86_64)
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Package Binary & Checksum
+        run: |
+          cd target/x86_64-unknown-linux-gnu/release
+          tar -czf ../../../dsnitch-x86_64-unknown-linux-gnu.tar.gz dsnitch
+          cd ../../..
+          sha256sum dsnitch-x86_64-unknown-linux-gnu.tar.gz > dsnitch-x86_64-unknown-linux-gnu.tar.gz.sha256
+
+      - name: Upload x86_64 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsnitch-x86_64
+          path: |
+            dsnitch-x86_64-unknown-linux-gnu.tar.gz
+            dsnitch-x86_64-unknown-linux-gnu.tar.gz.sha256
+
+  build-arm:
+    name: Build Release (aarch64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nightly Rust (with rust-src)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Install Stable Rust for aarch64
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install bpf-linker
+        uses: taiki-e/install-action@v2
+        with:
+          tool: bpf-linker
+
+      - name: Install aarch64 cross-linker
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-aarch64
+
+      - name: Build eBPF Bytecode
+        run: cargo xtask build-ebpf --release
+
+      - name: Build dsnitch Release (aarch64)
+        run: |
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: Package Binary & Checksum
+        run: |
+          cd target/aarch64-unknown-linux-gnu/release
+          tar -czf ../../../dsnitch-aarch64-unknown-linux-gnu.tar.gz dsnitch
+          cd ../../..
+          sha256sum dsnitch-aarch64-unknown-linux-gnu.tar.gz > dsnitch-aarch64-unknown-linux-gnu.tar.gz.sha256
+
+      - name: Upload aarch64 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsnitch-aarch64
+          path: |
+            dsnitch-aarch64-unknown-linux-gnu.tar.gz
+            dsnitch-aarch64-unknown-linux-gnu.tar.gz.sha256
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build-x86, build-arm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dsnitch-*.tar.gz
+            dsnitch-*.sha256
+          generate_release_notes: true
