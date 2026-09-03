@@ -96,30 +96,63 @@ A single-binary, lightweight, zero-configuration, real-time terminal UI (TUI) ne
 
 ---
 
-## Quickstart & Installation
+## Installation
 
-### Prerequisites
-- **Linux Kernel**: Version **5.8+** with unified cgroups v2 (`/sys/fs/cgroup`) and BTF enabled.
-- **Docker Engine**: Access to Docker daemon (`/var/run/docker.sock`).
-- **Rust Toolchain**: Nightly toolchain installed (for building eBPF bytecode via `bpfel-unknown-none`).
+### Download a Prebuilt Binary
+Generic precompiled 64-bit binaries are available for Linux on the [GitHub Releases](https://github.com/infomaniac777/dsnitch/releases) page:
+
+| Architecture | Platform Target | Support |
+| :--- | :--- | :--- |
+| **x86_64** | `x86_64-unknown-linux-gnu` | Full (Intel/AMD Desktops, Servers, VMs) |
+| **ARM64** | `aarch64-unknown-linux-gnu` | Full (Raspberry Pi 4/5, Graviton, Apple Silicon VMs) |
+
+```bash
+# Download and extract the latest release (example for x86_64):
+curl -sSL https://github.com/infomaniac777/dsnitch/releases/latest/download/dsnitch-x86_64-unknown-linux-gnu.tar.gz | tar -xz
+sudo mv dsnitch /usr/local/bin/
+```
 
 ### Building from Source
+
+#### Prerequisites
+- **Linux Kernel**: Version **5.8+** with unified cgroups v2 (`/sys/fs/cgroup`) and BTF enabled.
+- **Docker Engine**: Access to Docker daemon (`/var/run/docker.sock`).
+- **Rust Toolchain**: Nightly toolchain installed with `rust-src` component (for compiling eBPF bytecode via `bpfel-unknown-none`).
 
 ```bash
 # 1. Clone repository
 git clone https://github.com/infomaniac777/dsnitch.git
 cd dsnitch
 
-# 2. Add eBPF compilation target
-rustup target add bpfel-unknown-none --toolchain nightly
-
-# 3. Build eBPF bytecode & release binary (recommended via cargo xtask)
+# 2. Build eBPF bytecode & release binary (via cargo xtask)
 cargo xtask build-ebpf --release
 cargo build --release
+```
 
-# Alternatively, compile eBPF directly:
-# cargo +nightly build --manifest-path dsnitch-ebpf/Cargo.toml --target bpfel-unknown-none --release -Z build-std=core
-# cargo build --release
+---
+
+## Running
+
+### 1. `setcap` (Recommended for Unprivileged Users)
+Permanently grant `dsnitch` its required Linux capabilities so any user in the `docker` group can run it without `sudo`:
+
+```bash
+# Assign minimal capabilities to the binary:
+sudo setcap cap_sys_admin,cap_net_admin,cap_dac_read_search+ep $(command -v dsnitch || echo ./target/release/dsnitch)
+
+# Run directly as an unprivileged user:
+dsnitch
+```
+
+#### Capabilities Explained:
+- **`cap_sys_admin`**: Grants `perf_event_open` rights to attach the TCP socket state tracepoint (`sock:inet_sock_set_state`).
+- **`cap_net_admin`**: Allows attaching passive in-kernel eBPF socket and packet probes to cgroup v2 (`connect4`, `connect6`, and DNS/ICMP packet snoopers).
+- **`cap_dac_read_search`**: Allows reading tracepoint format descriptors from `/sys/kernel/tracing` without requiring full root privileges.
+
+### 2. `sudo` (Standard Alternative)
+Alternatively, run directly with root escalation:
+```bash
+sudo ./target/release/dsnitch
 ```
 
 ---
@@ -129,7 +162,8 @@ cargo build --release
 ### 1. Interactive TUI Mode (Default on TTY)
 Launch the full interactive split-pane interface:
 ```bash
-sudo ./target/release/dsnitch
+dsnitch
+# or: sudo ./target/release/dsnitch
 ```
 
 #### Interactive Controls & Keybindings
