@@ -1,5 +1,7 @@
 # dsnitch
 
+[![CI](https://github.com/infomaniac777/dsnitch/actions/workflows/ci.yml/badge.svg)](https://github.com/infomaniac777/dsnitch/actions/workflows/ci.yml)
+
 A single-binary, lightweight, zero-configuration, real-time terminal UI (TUI) network and DNS egress inspector for Docker containers powered by modern Linux eBPF.
 
 `dsnitch` provides instantaneous attribution of all outbound Layer 4 connections (TCP/UDP), Layer 3 ICMP pings, and Layer 7 DNS queries directly to specific Docker container names and Docker Compose service labels without modifying container network stacks, running sidecars, or installing heavy telemetry daemons.
