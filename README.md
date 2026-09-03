@@ -1,6 +1,6 @@
 # dsnitch
 
-A single-binary, zero-overhead, real-time terminal UI (TUI) network and DNS egress inspector for Docker containers powered by modern Linux eBPF.
+A single-binary, lightweight, zero-configuration, real-time terminal UI (TUI) network and DNS egress inspector for Docker containers powered by modern Linux eBPF.
 
 `dsnitch` provides instantaneous attribution of all outbound Layer 4 connections (TCP/UDP), Layer 3 ICMP pings, and Layer 7 DNS queries directly to specific Docker container names and Docker Compose service labels without modifying container network stacks, running sidecars, or installing heavy telemetry daemons.
 
@@ -9,13 +9,25 @@ A single-binary, zero-overhead, real-time terminal UI (TUI) network and DNS egre
 ## Key Features
 
 - **Zero-Touch Container Attribution**: Attaches directly to the host's unified cgroup v2 hierarchy (`/sys/fs/cgroup`) via eBPF. Zero sidecars, proxies, or container agent injections required.
-- **In-Kernel DNS Snooping & Enrichment**: Intercepts UDP/53 DNS queries and responses in kernel space with Hickory DNS (`hickory-proto`), resolving IP addresses to human-readable domain names (with full CNAME chain resolution) per container cgroup.
+- **In-Kernel DNS Snooping & Userspace Enrichment**: Intercepts raw UDP/53 packet payloads in kernel space via eBPF ring buffers, with userspace Hickory DNS decoding the records to map IP endpoints to domain names (with full CNAME chain resolution) per container cgroup.
 - **Deterministic Stateful Socket Tracking (`skaddr`)**: Hooks kernel `sock:inet_sock_set_state` to track the full lifecycle of TCP connections (`● ACTIVE` -> `○ CLOSED`) keyed by physical 64-bit kernel memory pointers (`skaddr`), guaranteeing 100% collision-free tracking across concurrent connections and network namespaces.
 - **Native ICMP Protocol Support**: Inspects Layer-3 IP header protocol bytes (`IPPROTO_ICMP = 1`, `IPPROTO_ICMPV6 = 58`) to cleanly capture container connectivity checks (`ping`) as `ICMP` without artificial port mangling.
 - **Dual Destination & Physical IP Columns**: Clean separation between DNS-resolved hostnames (`api.github.com:443`) and underlying edge IP endpoints (`20.207.73.85:443`).
 - **Glibc Noise Filtering**: Intelligently skips dummy POSIX/glibc `getaddrinfo()` UDP port `0` route-lookup probes.
 - **Interactive Split-Pane TUI (Ratatui)**: Container hierarchy tree with live connection counters on the left, real-time color-coded egress stream on the right, instant search filtering, container locking, and host traffic toggling.
 - **Headless / Streaming Mode (`-s`)**: Supports non-interactive plain-text streaming for logging, CI/CD, or headless pipelines.
+
+---
+
+## Why dsnitch? (How It Compares)
+
+| Capability / Dimension | `tcpdump` / `wireshark` | `conntrack -E` | `ss` / `netstat` | Sidecars (Envoy / Istio) | OpenSnitch | `dsnitch` |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Container Attribution** | ❌ None (bridge packets only) | ❌ None (L4 flow table) | ⚠️ Polling inside netns | ✅ Full | ⚠️ Host PID only | ✅ Instant Docker & Compose label resolution |
+| **DNS Domain Correlation** | ⚠️ Raw payload dump | ❌ None (IPs only) | ❌ None | ✅ L7 HTTP proxy | ⚠️ Reverse DNS | ✅ In-kernel DNS snoop + CNAME cache |
+| **Lifecycle Tracking** | ⚠️ Raw packet stream | ⚠️ L4 TCP states | ❌ Misses <100ms sockets | ✅ Full session | ⚠️ Interactive prompts | ✅ Deterministic in-kernel `skaddr` lifecycle |
+| **Overhead & Latency** | ⚠️ Packet copy overhead | ✅ Low | ⚠️ Polling CPU cost | ❌ Proxy latency & 50-100MB RAM/pod | ⚠️ Desktop UI / prompt latency | ✅ Near-zero (<1% CPU, event-driven eBPF) |
+| **Zero Modifications** | ✅ Yes | ✅ Yes | ⚠️ Needs netns access | ❌ Needs YAML & pod restarts | ✅ Yes | ✅ 100% passive, zero container changes |
 
 ---
 
@@ -82,7 +94,7 @@ A single-binary, zero-overhead, real-time terminal UI (TUI) network and DNS egre
 ## Quickstart & Installation
 
 ### Prerequisites
-- **Linux Kernel**: Version **5.8+** with cgroups v2 (`/sys/fs/cgroup`) and BTF enabled.
+- **Linux Kernel**: Version **5.8+** with unified cgroups v2 (`/sys/fs/cgroup`) and BTF enabled.
 - **Docker Engine**: Access to Docker daemon (`/var/run/docker.sock`).
 - **Rust Toolchain**: Nightly toolchain installed (for building eBPF bytecode via `bpfel-unknown-none`).
 
@@ -96,9 +108,13 @@ cd dsnitch
 # 2. Add eBPF compilation target
 rustup target add bpfel-unknown-none --toolchain nightly
 
-# 3. Build eBPF bytecode & release binary
-cargo +nightly build --manifest-path dsnitch-ebpf/Cargo.toml --target bpfel-unknown-none --release -Z build-std=core
+# 3. Build eBPF bytecode & release binary (recommended via cargo xtask)
+cargo xtask build-ebpf --release
 cargo build --release
+
+# Alternatively, compile eBPF directly:
+# cargo +nightly build --manifest-path dsnitch-ebpf/Cargo.toml --target bpfel-unknown-none --release -Z build-std=core
+# cargo build --release
 ```
 
 ---
@@ -283,19 +299,29 @@ STATUS     TIME         CONTAINER       SERVICE    IMAGE/PROCESS    PROTO  DESTI
 Usage: dsnitch [OPTIONS]
 
 Options:
-  -s, --stream               Enable non-interactive streaming mode (plain text table output)
-      --tui                  Force interactive TUI mode (default when attached to a TTY)
+      --cgroup-path <PATH>   Cgroup v2 root path [default: /sys/fs/cgroup]
   -a, --all                  Include host processes in monitoring alongside Docker containers
-  -g, --grace-period <SECS>  Grace period in seconds before pruning closed connections [default: 5]
-  -m, --max-entries <COUNT>  Maximum connection history items to retain in memory [default: 1000]
+  -s, --stream               Run in plain streaming output mode instead of interactive TUI
+      --tui                  Force interactive TUI mode (default when attached to a TTY)
+      --grace-period <SECS>  Grace period in seconds to retain closed connections before removal [default: 5]
   -h, --help                 Print help
   -V, --version              Print version
 ```
 
 ---
 
-## Architecture & Engineering Invariants
+## Security, Permissions & Safety Invariants
 
-1. **Passive Read-Only Safety**: The eBPF probes inspect socket and packet headers without blocking, modifying, or dropping packets (`return 1`), ensuring host network stability.
-2. **Deterministic `skaddr` Correlation**: Sockets transition through kernel states (`TCP_SYN_SENT` -> `TCP_CLOSE`) mapped directly to their kernel `struct sock *` pointer address, eliminating multi-connection race conditions.
-3. **Multi-Tenant DNS Isolation**: DNS records are isolated by `cgroup_id` so that overlapping container networks or shared Anycast/CDN IPs do not cross-contaminate hostname resolution.
+1. **Privilege Model**:
+   - `dsnitch` requires elevated privileges to attach eBPF probes to the root cgroup hierarchy:
+     ```bash
+     sudo ./target/release/dsnitch
+     ```
+   - Alternatively, grant explicit Linux capabilities without full root:
+     ```bash
+     sudo setcap cap_bpf,cap_perfmon,cap_net_admin+ep ./target/release/dsnitch
+     ```
+   - Requires read access to the Docker daemon socket (`/var/run/docker.sock`) and unified cgroup v2 hierarchy (`/sys/fs/cgroup`).
+2. **Passive Read-Only Safety**: All in-kernel eBPF probes inspect socket and packet headers without blocking, redirecting, or dropping packets (`return 1`), guaranteeing host network stability.
+3. **Deterministic `skaddr` Correlation**: Sockets transition through kernel states (`TCP_SYN_SENT` -> `TCP_CLOSE`) mapped directly to their kernel `struct sock *` pointer address, eliminating multi-connection race conditions.
+4. **Multi-Tenant DNS Isolation**: DNS records are isolated by `cgroup_id` so that overlapping container networks or shared Anycast/CDN IPs do not cross-contaminate hostname resolution.
