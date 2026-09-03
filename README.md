@@ -1,6 +1,7 @@
 # dsnitch
 
-[![CI](https://github.com/infomaniac777/dsnitch/actions/workflows/ci.yml/badge.svg)](https://github.com/infomaniac777/dsnitch/actions/workflows/ci.yml)
+[![CI (x86_64)](https://github.com/infomaniac777/dsnitch/actions/workflows/ci-x86.yml/badge.svg)](https://github.com/infomaniac777/dsnitch/actions/workflows/ci-x86.yml)
+[![CI (aarch64)](https://github.com/infomaniac777/dsnitch/actions/workflows/ci-arm.yml/badge.svg)](https://github.com/infomaniac777/dsnitch/actions/workflows/ci-arm.yml)
 
 A single-binary, lightweight, zero-configuration, real-time terminal UI (TUI) network and DNS egress inspector for Docker containers powered by modern Linux eBPF.
 

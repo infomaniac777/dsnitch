@@ -1,4 +1,4 @@
-name: CI
+name: CI (x86_64)
 
 on:
   push:
@@ -8,12 +8,11 @@ on:
 
 jobs:
   build:
-    name: Build & Verify
+    name: Build (x86_64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Install Rust toolchains (nightly with rust-src for eBPF + stable for userspace)
       - name: Install Nightly Rust (with rust-src)
         uses: dtolnay/rust-toolchain@nightly
         with:
@@ -22,20 +21,18 @@ jobs:
       - name: Install Stable Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # 2. Install bpf-linker via pre-built binary
       - name: Install bpf-linker
         uses: taiki-e/install-action@v2
         with:
           tool: bpf-linker
 
-      # 3. Cache dependencies
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64
 
-      # 4. Build eBPF Bytecode
       - name: Build eBPF Bytecode
         run: cargo xtask build-ebpf --release
 
-      # 5. Build dsnitch Release Binary
-      - name: Build dsnitch Release
+      - name: Build dsnitch Release (x86_64)
         run: cargo build --release
