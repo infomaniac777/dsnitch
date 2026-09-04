@@ -5,9 +5,31 @@
 [![Unit Tests](https://github.com/infomaniac777/dsnitch/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/infomaniac777/dsnitch/actions/workflows/unit-tests.yml)
 [![E2E Tests](https://github.com/infomaniac777/dsnitch/actions/workflows/e2e.yml/badge.svg)](https://github.com/infomaniac777/dsnitch/actions/workflows/e2e.yml)
 
+![demo](res/demo.gif)
+
 A single-binary, lightweight, zero-configuration, real-time terminal UI (TUI) network and DNS egress inspector for Docker containers powered by modern Linux eBPF.
 
 `dsnitch` provides instantaneous attribution of all outbound Layer 4 connections (TCP/UDP), Layer 3 ICMP pings, and Layer 7 DNS queries directly to specific Docker container names and Docker Compose service labels without modifying container network stacks, running sidecars, or installing heavy telemetry daemons.
+
+---
+
+## Table of Contents
+- [Key Features](#key-features)
+- [How Does It Work?](#how-does-it-work)
+- [Installation](#installation)
+  - [Download a Prebuilt Binary](#download-a-prebuilt-binary)
+  - [Building from Source](#building-from-source)
+- [Running](#running)
+  - [1. setcap (Recommended for Unprivileged Users)](#1-setcap-recommended-for-unprivileged-users)
+  - [2. sudo (Standard Alternative)](#2-sudo-standard-alternative)
+- [Usage](#usage)
+  - [1. Interactive TUI Mode](#1-interactive-tui-mode-default-on-tty)
+  - [2. Custom Grace Period](#2-custom-grace-period)
+  - [3. Plain-Text Streaming Mode](#3-plain-text-streaming-mode--s)
+- [Testing](#testing)
+- [CLI Options Reference](#cli-options-reference)
+- [Architecture & Design (DESIGN.md)](DESIGN.md)
+- [License](#license)
 
 ---
 
@@ -24,75 +46,11 @@ A single-binary, lightweight, zero-configuration, real-time terminal UI (TUI) ne
 
 ---
 
-## Why dsnitch? (How It Compares)
+## How Does It Work?
 
-| Capability / Dimension | `tcpdump` / `wireshark` | `conntrack -E` | `ss` / `netstat` | Sidecars (Envoy / Istio) | OpenSnitch | `dsnitch` |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Container Attribution** | ❌ None (bridge packets only) | ❌ None (L4 flow table) | ⚠️ Polling inside netns | ✅ Full | ⚠️ Host PID only | ✅ Instant Docker & Compose label resolution |
-| **DNS Domain Correlation** | ⚠️ Raw payload dump | ❌ None (IPs only) | ❌ None | ✅ L7 HTTP proxy | ⚠️ Reverse DNS | ✅ In-kernel DNS snoop + CNAME cache |
-| **Lifecycle Tracking** | ⚠️ Raw packet stream | ⚠️ L4 TCP states | ❌ Misses <100ms sockets | ✅ Full session | ⚠️ Interactive prompts | ✅ Deterministic in-kernel `skaddr` lifecycle |
-| **Overhead & Latency** | ⚠️ Packet copy overhead | ✅ Low | ⚠️ Polling CPU cost | ❌ Proxy latency & 50-100MB RAM/pod | ⚠️ Desktop UI / prompt latency | ✅ Near-zero (<1% CPU, event-driven eBPF) |
-| **Zero Modifications** | ✅ Yes | ✅ Yes | ⚠️ Needs netns access | ❌ Needs YAML & pod restarts | ✅ Yes | ✅ 100% passive, zero container changes |
+`dsnitch` attaches passive, in-kernel eBPF probes directly to the host's unified cgroup v2 hierarchy (`/sys/fs/cgroup`) and the kernel's TCP socket state tracepoint. It intercepts outbound connection requests (TCP/UDP), Layer-3 ICMP pings, and raw DNS wire payloads on port 53, correlating sockets to Docker container metadata and resolved hostnames in userspace via lockless BPF ring buffers with near-zero (<1%) CPU overhead.
 
----
-
-## Protocol & eBPF Hook Matrix
-
-`dsnitch` uses distinct, specialized eBPF program types tailored to each protocol's semantics:
-
-| Protocol | eBPF Hook / Program Type | Lifecycle & Attribution Mechanism |
-| :--- | :--- | :--- |
-| **TCP** | `tracepoint/sock/inet_sock_set_state` | **Activation (`TCP_SYN_SENT = 2`)**: Captures outbound connection initiation in the task's syscall context, binding the container metadata to the 64-bit kernel socket address (`skaddr`) and client port (`sport`).<br>**Termination (`TCP_CLOSE = 7` / `TCP_TIME_WAIT = 6`)**: Matches the exact socket by `skaddr` to transition state to `○ CLOSED` with 0% softirq context collision risk. |
-| **UDP** | `cgroup_sock_addr/connect4`<br>`cgroup_sock_addr/connect6` | Intercepts outbound UDP `connect()` syscalls with container `cgroup_id`. Sockets are tracked with a 3-second sliding activity window in userspace before transitioning to `○ CLOSED`. |
-| **ICMP / ICMPv6** | `cgroup_skb/egress` | Intercepts raw Layer-3 IP packets. Parses IP header protocol bytes (`proto == 1` for ICMPv4, `proto == 58` for ICMPv6), extracts destination IP directly from packet headers, and tags with container `bpf_skb_cgroup_id(skb)`. |
-| **DNS (UDP 53)** | `cgroup_skb/ingress`<br>`cgroup_skb/egress` | Inspects UDP/53 packet wire payloads (up to 768 bytes), emitting raw DNS events tagged with `cgroup_id`. Userspace parses answers with Hickory DNS to populate the per-cgroup `(cgroup_id, IP) -> DomainName` cache. |
-
----
-
-## System Architecture
-
-```text
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            In-Kernel eBPF Layer                             │
-├───────────────────────┬────────────────────────────┬────────────────────────┤
-│  connect4 / connect6  │   cgroup_skb (in/egress)   │  inet_sock_set_state   │
-│  (cgroup_sock_addr)   │   (DNS & Layer-3 ICMP)     │      (Tracepoint)      │
-└───────────┬───────────┴──────────────┬─────────────┴───────────┬────────────┘
-            │ (ConnectEvent)           │ (DnsPacketEvent)        │ (SocketCloseEvent)
-            ▼                          ▼                         ▼
-     EVENTS RingBuf             DNS_EVENTS RingBuf        CLOSE_EVENTS RingBuf
-  (BPF_MAP_TYPE_RINGBUF)     (BPF_MAP_TYPE_RINGBUF)    (BPF_MAP_TYPE_RINGBUF)
-            │                          │                         │
-════════════╪══════════════════════════╪═════════════════════════╪═════════════ IPC (mmap / epoll)
-            │                          │                         │
-┌───────────▼──────────────────────────▼─────────────────────────▼────────────┐
-│                         Userspace Engine (Rust / Tokio)                     │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  • Docker Engine Synchronizer (Bollard):                                    │
-│      Resolves cgroup_id <-> container_name / compose_service.                │
-│      Maintains running / recently-stopped cache via Docker events stream.   │
-│                                                                             │
-│  • Per-Cgroup DNS Correlation Cache (Hickory DNS):                          │
-│      Isolated in-memory cache mapping (cgroup_id, IP) -> DomainName         │
-│      Resolves full CNAME chains with fallback to prevent CDN IP collisions. │
-│                                                                             │
-│  • Stateful Socket Tracker (skaddr):                                        │
-│      Tracks connection state transitions: [● ACTIVE] -> [○ CLOSED].         │
-│      Prunes closed sockets after configurable --grace-period (default 5s).  │
-└──────────────────────────────────────┬──────────────────────────────────────┘
-                                       │
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           Ratatui Split-Pane TUI                            │
-│  ┌──────────────────────────────┬────────────────────────────────────────┐  │
-│  │ Containers Pane              │ Live Egress Feed Table                 │  │
-│  │ ● web-worker (backend) [12]  │ STATUS   TIME  SERVICE  PROTO DEST  IP │  │
-│  │ ● db-worker  (postgres)[4]   │ ● ACTIVE 1.2s  backend  TCP   ...   ...│  │
-│  │ ○ cache-box  (redis)   [0]   │ ○ CLOSED 1.8s  backend  TCP   ...   ...│  │
-│  └──────────────────────────────┴────────────────────────────────────────┘  │
-│  [Tab] Switch Pane  [/] Filter  [Enter] Lock Container  [a] Host Toggle  [q] Quit │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+> For in-depth kernel architecture, eBPF hook internals, and comparison matrices, see [**DESIGN.md**](DESIGN.md).
 
 ---
 
@@ -138,7 +96,8 @@ Permanently grant `dsnitch` its required Linux capabilities so any user in the `
 
 ```bash
 # Assign minimal capabilities to the binary:
-sudo setcap cap_sys_admin,cap_net_admin,cap_dac_read_search+ep $(command -v dsnitch || echo ./target/release/dsnitch)
+# (Note: If running directly from a local source build, replace $(command -v dsnitch) with ./target/release/dsnitch)
+sudo setcap cap_sys_admin,cap_net_admin,cap_dac_read_search+ep $(command -v dsnitch)
 
 # Run directly as an unprivileged user:
 dsnitch
@@ -149,10 +108,19 @@ dsnitch
 - **`cap_net_admin`**: Allows attaching passive in-kernel eBPF socket and packet probes to cgroup v2 (`connect4`, `connect6`, and DNS/ICMP packet snoopers).
 - **`cap_dac_read_search`**: Allows reading tracepoint format descriptors from `/sys/kernel/tracing` without requiring full root privileges.
 
+> [!NOTE]
+> **Why `CAP_SYS_ADMIN` instead of `CAP_PERFMON` on Debian / Ubuntu / Fedora?**  
+> While upstream Linux 5.8+ split eBPF privileges into `CAP_BPF` and `CAP_PERFMON`, major distributions ship with `kernel.perf_event_paranoid >= 2` by default. Under this security policy, the kernel's `perf_event_open` subsystem explicitly mandates `CAP_SYS_ADMIN` to attach tracepoints (`sock:inet_sock_set_state`), ignoring `CAP_PERFMON`.  
+> 
+> If your host has `kernel.perf_event_paranoid <= 1` (or if configured via `sudo sysctl -w kernel.perf_event_paranoid=1`), `dsnitch` runs under the strict minimal set without `CAP_SYS_ADMIN`:
+> ```bash
+> sudo setcap cap_bpf,cap_perfmon,cap_net_admin,cap_dac_read_search+ep $(command -v dsnitch)
+> ```
+
 ### 2. `sudo` (Standard Alternative)
 Alternatively, run directly with root escalation:
 ```bash
-sudo ./target/release/dsnitch
+sudo dsnitch
 ```
 
 ---
@@ -163,7 +131,6 @@ sudo ./target/release/dsnitch
 Launch the full interactive split-pane interface:
 ```bash
 dsnitch
-# or: sudo ./target/release/dsnitch
 ```
 
 #### Interactive Controls & Keybindings
@@ -183,7 +150,7 @@ dsnitch
 ### 2. Custom Grace Period
 Retain closed connections on screen for a custom duration (e.g. 10 seconds) before auto-pruning:
 ```bash
-sudo ./target/release/dsnitch --grace-period 10
+dsnitch --grace-period 10
 ```
 
 ---
@@ -192,10 +159,10 @@ sudo ./target/release/dsnitch --grace-period 10
 Ideal for headless logging, scripts, or piping to other CLI tools:
 ```bash
 # Docker containers only
-sudo ./target/release/dsnitch -s
+dsnitch -s
 
 # Docker containers + Host processes
-sudo ./target/release/dsnitch -a -s
+dsnitch -a -s
 ```
 
 ---
@@ -209,7 +176,7 @@ sudo ./target/release/dsnitch -a -s
 cargo test
 
 # Run automated E2E integration suite (Docker required):
-sudo bash tests/e2e.sh
+bash tests/e2e.sh
 ```
 
 ---
@@ -231,18 +198,6 @@ Options:
 
 ---
 
-## Security, Permissions & Safety Invariants
+## License
 
-1. **Privilege Model**:
-   - `dsnitch` requires elevated privileges to attach eBPF probes to the root cgroup hierarchy:
-     ```bash
-     sudo ./target/release/dsnitch
-     ```
-   - Alternatively, grant explicit Linux capabilities without full root:
-     ```bash
-     sudo setcap cap_sys_admin,cap_net_admin,cap_dac_read_search+ep ./target/release/dsnitch
-     ```
-   - Requires read access to the Docker daemon socket (`/var/run/docker.sock`) and unified cgroup v2 hierarchy (`/sys/fs/cgroup`).
-2. **Passive Read-Only Safety**: All in-kernel eBPF probes inspect socket and packet headers without blocking, redirecting, or dropping packets (`return 1`), guaranteeing host network stability.
-3. **Deterministic `skaddr` Correlation**: Sockets transition through kernel states (`TCP_SYN_SENT` -> `TCP_CLOSE`) mapped directly to their kernel `struct sock *` pointer address, eliminating multi-connection race conditions.
-4. **Multi-Tenant DNS Isolation**: DNS records are isolated by `cgroup_id` so that overlapping container networks or shared Anycast/CDN IPs do not cross-contaminate hostname resolution.
+GNU General Public License v3.0 ([LICENSE](LICENSE))
